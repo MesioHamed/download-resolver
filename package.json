@@ -1,0 +1,13 @@
+{
+  "name": "download-resolver",
+  "version": "1.0.0",
+  "description": "Resolve short links and download files using Playwright",
+  "main": "scripts/resolve_download.js",
+  "scripts": {
+    "start": "node scripts/resolve_download.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "adm-zip": "^0.5.9"
+  }
+}
