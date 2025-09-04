@@ -1,116 +1,93 @@
 // scripts/resolve_download.js
+// Robust resolver that actively finds & clicks download buttons (site-specific + fallbacks)
+// Writes debug/page.html, debug/page.png, debug/network_log.json, debug/candidate_anchors.json
 const fs = require('fs');
 const path = require('path');
 const { chromium } = require('playwright');
 
-async function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
+function ensureDir(d) { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); }
+function writeFile(p, data) { fs.writeFileSync(p, data, { encoding: 'utf8' }); console.log('WROTE:', p); }
 
-async function run() {
-  const url = process.argv[2] || process.env.SHORT_LINK;
-  if (!url) {
-    console.error("Usage: node resolve_download.js <short-link>");
-    process.exit(2);
-  }
-
-  await ensureDir('downloads');
-
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
-  console.log("Opening:", url);
+async function clickIfExists(frame, selector) {
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  } catch (e) {
-    console.error("Error loading page:", e.message);
-  }
-
-  // Heuristic download selectors - adjustable per site
-  const selectors = [
-    'button:has-text("Download")',
-    'a:has-text("Download")',
-    'text=Download',
-    'button[data-test="download-button"]',
-    '.download-button',
-    '#downloadButton',
-    'a[href*="/download"]',
-    'a:has-text("Save")'
-  ];
-
-  // Listen for "download" events
-  let downloaded = null;
-  page.on('download', async (download) => {
-    const suggested = download.suggestedFilename() || 'file';
-    const filepath = path.join('downloads', suggested);
+    const el = await frame.$(selector);
+    if (!el) return false;
+    await el.scrollIntoViewIfNeeded?.();
     try {
-      await download.saveAs(filepath);
-      downloaded = filepath;
-      console.log("SAVED_FILE:", filepath);
+      // try to click normally and wait for download signal in caller
+      await el.click({ timeout: 8000 }).catch(()=>{});
+      return true;
     } catch (e) {
-      console.error("Download save error:", e.message);
-    }
-  });
-
-  // Also inspect network responses for attachment content-disposition (fallback)
-  page.on('response', async (response) => {
-    try {
-      const h = response.headers();
-      if (h['content-disposition'] && /attachment/i.test(h['content-disposition'])) {
-        const url = response.url();
-        console.log("RESPONSE_ATTACHMENT_URL:", url);
-      }
-    } catch (e) {}
-  });
-
-  // Try clicking likely download buttons (first present)
-  for (const sel of selectors) {
-    try {
-      const el = await page.$(sel);
-      if (el) {
-        console.log("Clicking selector:", sel);
-        try {
-          await Promise.all([
-            page.waitForEvent('download', { timeout: 15000 }).catch(()=>{}),
-            el.click({ timeout: 10000 })
-          ]);
-        } catch (e) {
-          // clicking may still trigger network flow, ignore errors
+      // fallback: click via evaluate (useful for hidden/shadow elements)
+      await frame.evaluate((s) => {
+        const el = document.querySelector(s);
+        if (el) {
+          el.click();
         }
-        // small wait for download to start
-        await page.waitForTimeout(3000);
-        if (downloaded) break;
-      }
-    } catch (e) {
-      // ignore selector errors
+      }, selector).catch(()=>{});
+      return true;
     }
-  }
-
-  // If no download event fired, try clicking "direct link" anchors
-  if (!downloaded) {
-    const anchors = await page.$$('a');
-    for (const a of anchors.slice(0, 40)) {
-      const href = await a.getAttribute('href');
-      if (!href) continue;
-      // quick heuristic: links that include "/download" or end with archive extension
-      if (/\/download|\.zip$|\.rar$|\.tgz$|\.tar\.gz$/i.test(href)) {
-        const abs = new URL(href, page.url()).toString();
-        console.log("POTENTIAL_DIRECT_LINK:", abs);
-      }
-    }
-  }
-
-  // Final reporting
-  if (downloaded) {
-    console.log("RESULT: SUCCESS", downloaded);
-    await browser.close();
-    process.exit(0);
-  } else {
-    console.log("RESULT: NO_FILE_FOUND");
-    await browser.close();
-    process.exit(3);
+  } catch (e) {
+    return false;
   }
 }
 
-run();
+async function clickByText(frame, textRegex) {
+  try {
+    const handles = await frame.$$('button, a, div, span');
+    for (const h of handles) {
+      try {
+        const inner = (await h.innerText()).trim();
+        if (!inner) continue;
+        if (textRegex.test(inner)) {
+          await h.scrollIntoViewIfNeeded?.();
+          await Promise.resolve(h.click()).catch(()=>{});
+          return true;
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  // fallback: evaluate find + click
+  try {
+    const clicked = await frame.evaluate((re) => {
+      const regex = new RegExp(re, 'i');
+      const tags = Array.from(document.querySelectorAll('button,a,div,span'));
+      for (const el of tags) {
+        try {
+          if (regex.test(el.innerText || '')) { el.click(); return true; }
+        } catch(e) {}
+      }
+      return false;
+    }, textRegex.source);
+    return !!clicked;
+  } catch (e) { return false; }
+}
+
+async function tryCookieAccept(frame) {
+  const acceptTexts = [/accept/i, /agree/i, /agree and continue/i, /accept all/i, /i agree/i];
+  for (const r of acceptTexts) {
+    const ok = await clickByText(frame, r);
+    if (ok) {
+      console.log('Clicked cookie/consent by text:', r);
+      await frame.waitForTimeout(1000);
+      return true;
+    }
+  }
+  // also try typical selectors
+  const selectors = ['button[id*="accept"]','button[class*="accept"]','button[class*="agree"]','button[aria-label*="accept"]'];
+  for (const s of selectors) {
+    if (await clickIfExists(frame, s)) { console.log('Clicked cookie selector:', s); await frame.waitForTimeout(800); return true; }
+  }
+  return false;
+}
+
+async function tryClickDownload(frame, hostname) {
+  // site-specific preferred selectors
+  if (/fromsmash/i.test(hostname)) {
+    const fromSmashSelectors = [
+      'button:has-text("Download")',
+      'button:has-text("Download file")',
+      'a.download',
+      'a[href*="/download"]'
+    ];
+    for (const s of fromSmashSelectors) i
