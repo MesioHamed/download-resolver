@@ -1,0 +1,44 @@
+name: Resolve and Download Short Link
+
+on:
+  workflow_dispatch:
+    inputs:
+      short_link:
+        description: 'Short link to resolve and download'
+        required: true
+        type: string
+
+jobs:
+  resolve-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run resolver
+        env:
+          SHORT_LINK: ${{ github.event.inputs.short_link }}
+        run: |
+          mkdir -p downloads
+          echo "Starting resolver for $SHORT_LINK"
+          node scripts/resolve_download.js "$SHORT_LINK" || true
+          echo "Contents of downloads:"
+          ls -la downloads || true
+
+      - name: Upload downloaded files as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-download
+          path: downloads/**
